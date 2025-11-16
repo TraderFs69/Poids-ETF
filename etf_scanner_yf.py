@@ -1,32 +1,38 @@
 import streamlit as st
 import pandas as pd
-import requests
+import yfinance as yf
 
 # ---------------- CONFIG ----------------
 st.set_page_config(
-    page_title="ETF Exposure ↔ Stocks (ETFdb)",
+    page_title="Stocks dans quels ETF ? (yfinance)",
     page_icon="📊",
     layout="wide"
 )
 
-st.title("📊 ETF Exposure ↔ Stocks (via ETFdb)")
+st.title("📊 Stocks → ETF (Top holdings via yfinance)")
 st.write(
     """
-    Cet outil récupère, pour **chaque stock**, la liste des **ETFs qui le détiennent**  
-    à partir des pages publiques d'**ETFdb** (ex.: https://etfdb.com/stock/AAPL/).
+    Entres **une liste d’ETF** et **une liste de stocks**.  
+    L’application utilise `yfinance` pour récupérer les **top holdings** de chaque ETF
+    et te montre **quels stocks se retrouvent dans quels ETF**, avec leur poids (%).
 
-    🔹 100 % gratuit, aucune clé API  
-    🔹 Résultat : tableau *Stock → ETF, Catégorie, Poids (%), Expense Ratio*  
-    🔹 Export CSV pour ton journal ou d'autres scripts
+    ⚠️ Limite : seulement les **top holdings** (souvent top 10) fournis par Yahoo Finance.
     """
 )
 
 # ---------------- SIDEBAR ----------------
 st.sidebar.header("⚙️ Paramètres")
 
+default_etfs = "SPY, QQQ, XLK, XLF, IWM"
+etf_input = st.sidebar.text_area(
+    "📦 Liste des ETF (séparés par des virgules)",
+    value=default_etfs,
+    help="Ex.: SPY, QQQ, XLK, XLF, IWM"
+)
+
 default_stocks = "AAPL, MSFT, TSLA, NVDA"
 stocks_input = st.sidebar.text_area(
-    "📈 Liste des stocks (séparés par des virgules)",
+    "📈 Liste des stocks à analyser (séparés par des virgules)",
     value=default_stocks,
     help="Ex.: AAPL, MSFT, TSLA, NVDA"
 )
@@ -48,139 +54,98 @@ def parse_tickers(text: str):
 
 
 @st.cache_data(show_spinner=True)
-def get_stock_etf_exposure_etfdb(symbol: str) -> pd.DataFrame:
+def get_etf_top_holdings(etf_symbol: str) -> pd.DataFrame:
     """
-    Va chercher la page ETFdb pour un stock (ex.: https://etfdb.com/stock/AAPL/)
-    et essaie de parser le tableau "ETFs with <stock> Exposure".
-
-    Retourne un DataFrame avec au moins :
-    - stock
-    - etf_ticker
-    - etf_name
-    - category
-    - expense_ratio
-    - weighting
+    Récupère les top holdings d'un ETF via yfinance.
+    Utilise Ticker.funds_data.top_holdings (voir docs yfinance).
     """
-
-    url = f"https://etfdb.com/stock/{symbol}/"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
-    }
-
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.raise_for_status()
+        ticker = yf.Ticker(etf_symbol)
+        funds_data = ticker.funds_data
+        top = funds_data.top_holdings
+
+        if top is None or top.empty:
+            return pd.DataFrame()
+
+        df = top.copy()
+
+        # Colonnes typiques: 'symbol', 'holdingName', 'holdingPercent'
+        rename_map = {
+            "symbol": "stock",
+            "holdingName": "stock_name",
+            "holdingPercent": "weight_pct",
+        }
+        df = df.rename(columns=rename_map)
+
+        # Si poids entre 0 et 1 → on le convertit en %
+        if "weight_pct" in df.columns:
+            if df["weight_pct"].max() <= 1.0:
+                df["weight_pct"] = df["weight_pct"] * 100
+
+        # On garde ce qui est utile
+        keep_cols = [c for c in ["stock", "stock_name", "weight_pct"] if c in df.columns]
+        df = df[keep_cols]
+
+        df["ETF"] = etf_symbol.upper()
+        return df
+
     except Exception as e:
-        st.warning(f"❗ Impossible de récupérer la page ETFdb pour {symbol}: {e}")
+        st.warning(f"❗ Impossible de récupérer les top holdings pour {etf_symbol.upper()} : {e}")
         return pd.DataFrame()
 
-    try:
-        # ETFdb a un tableau principal "ETFs with <stock> Exposure"
-        tables = pd.read_html(resp.text)
-    except ValueError:
-        # Aucun tableau trouvé
-        st.warning(f"⚠️ Aucun tableau détecté sur ETFdb pour {symbol}.")
-        return pd.DataFrame()
 
-    if not tables:
-        st.warning(f"⚠️ Aucun tableau détecté sur ETFdb pour {symbol}.")
-        return pd.DataFrame()
+def build_stock_etf_mapping(etfs, stocks_filter):
+    """
+    Construit un DataFrame avec les liens Stock ↔ ETF
+    sur base des top holdings yfinance.
+    """
+    all_frames = []
 
-    # En général, le premier tableau est le bon
-    df = tables[0].copy()
+    for etf in etfs:
+        df_etf = get_etf_top_holdings(etf)
+        if df_etf.empty:
+            st.warning(f"⚠️ Aucun top holding trouvé (ou pas reconnu comme ETF) pour {etf.upper()}.")
+            continue
+        all_frames.append(df_etf)
 
-    # Aplanir les colonnes si MultiIndex
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
+    if not all_frames:
+        return pd.DataFrame(), pd.DataFrame()
+
+    holdings_all = pd.concat(all_frames, ignore_index=True)
+
+    # Filtre les stocks si une liste est fournie
+    if stocks_filter:
+        holdings_filtered = holdings_all[holdings_all["stock"].isin(stocks_filter)].copy()
     else:
-        df.columns = [str(c) for c in df.columns]
+        holdings_filtered = holdings_all.copy()
 
-    # On essaie de repérer les colonnes importantes
-    col_map = {
-        "Ticker": None,
-        "ETF": None,
-        "ETF Database Category": None,
-        "Expense Ratio": None,
-        "Weighting": None,
-    }
+    # Tri
+    if "weight_pct" in holdings_filtered.columns:
+        holdings_filtered = holdings_filtered.sort_values(
+            ["stock", "weight_pct"], ascending=[True, False]
+        )
+    else:
+        holdings_filtered = holdings_filtered.sort_values(["stock", "ETF"])
 
-    for col in df.columns:
-        col_norm = col.strip().lower()
-        if "ticker" in col_norm and col_map["Ticker"] is None:
-            col_map["Ticker"] = col
-        elif col_norm == "etf" and col_map["ETF"] is None:
-            col_map["ETF"] = col
-        elif "database category" in col_norm and col_map["ETF Database Category"] is None:
-            col_map["ETF Database Category"] = col
-        elif "expense" in col_norm and col_map["Expense Ratio"] is None:
-            col_map["Expense Ratio"] = col
-        elif "weight" in col_norm and col_map["Weighting"] is None:
-            col_map["Weighting"] = col
+    # Matrice pivot stock x ETF
+    if "weight_pct" in holdings_filtered.columns:
+        pivot = holdings_filtered.pivot_table(
+            index="stock",
+            columns="ETF",
+            values="weight_pct",
+            aggfunc="sum"
+        )
+    else:
+        pivot = pd.DataFrame()
 
-    # On garde seulement les colonnes qu'on a réussi à identifier
-    keep_real_cols = [c for c in col_map.values() if c is not None]
-    if not keep_real_cols:
-        st.warning(f"⚠️ Impossible d'identifier les colonnes du tableau pour {symbol}.")
-        return pd.DataFrame()
-
-    df = df[keep_real_cols].copy()
-
-    # Renommer en noms standard
-    rename_to = {}
-    for canonical, real_col in col_map.items():
-        if real_col is not None:
-            rename_to[real_col] = canonical
-
-    df = df.rename(columns=rename_to)
-
-    # Supprimer les éventuelles lignes d'en-têtes répétées (quand la table est paginée dans le HTML)
-    if "Ticker" in df.columns:
-        df = df[df["Ticker"].astype(str).str.upper() != "TICKER"]
-
-    # Nettoyages simples
-    if "Expense Ratio" in df.columns:
-        df["Expense Ratio"] = df["Expense Ratio"].astype(str).str.strip()
-    if "Weighting" in df.columns:
-        df["Weighting"] = df["Weighting"].astype(str).str.strip()
-
-    # Ajouter le symbole du stock
-    df["stock"] = symbol.upper()
-
-    # Réordonner les colonnes pour quelque chose de propre
-    ordered_cols = ["stock", "Ticker", "ETF", "ETF Database Category", "Expense Ratio", "Weighting"]
-    ordered_cols = [c for c in ordered_cols if c in df.columns]
-    df = df[ordered_cols]
-
-    return df
-
-
-def build_exposure(stocks):
-    """
-    Construit un DataFrame consolidé Stock → ETFs.
-    """
-    frames = []
-    for s in stocks:
-        sub = get_stock_etf_exposure_etfdb(s)
-        if sub.empty:
-            st.warning(f"⚠️ Aucun ETF trouvé (ou parsing impossible) pour {s}.")
-        else:
-            frames.append(sub)
-
-    if not frames:
-        return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True)
-    return combined
+    return holdings_filtered, pivot
 
 
 # ---------------- MAIN LOGIC ----------------
+etf_list = parse_tickers(etf_input)
 stocks_list = parse_tickers(stocks_input)
 
-# Si CSV uploadé, on fusionne
+# Merge avec CSV éventuel
 if upload_file is not None:
     try:
         df_upload = pd.read_csv(upload_file)
@@ -193,34 +158,40 @@ if upload_file is not None:
         st.sidebar.warning(f"Erreur lors de la lecture du CSV : {e}")
 
 if run_scan:
-    if not stocks_list:
-        st.error("❌ Merci d'indiquer au moins un stock.")
+    if not etf_list:
+        st.error("❌ Indique au moins un ETF.")
+    elif not stocks_list:
+        st.error("❌ Indique au moins un stock.")
     else:
-        with st.spinner("Récupération de l'exposition ETF pour chaque stock via ETFdb..."):
-            df_result = build_exposure(stocks_list)
+        with st.spinner("Récupération des top holdings des ETF via yfinance..."):
+            df_links, df_matrix = build_stock_etf_mapping(etf_list, stocks_list)
 
-        if df_result.empty:
-            st.warning("Aucun résultat exploitable trouvé avec ces paramètres.")
+        if df_links.empty:
+            st.warning("Aucun lien Stock ↔ ETF trouvé avec ces paramètres (dans les top holdings).")
         else:
-            st.subheader("📋 Exposition ETF par stock")
+            st.subheader("📋 Stocks présents dans les top holdings des ETF")
 
             st.write(
-                "Chaque ligne représente un **ETF qui détient ce stock**, "
-                "avec sa catégorie, son expense ratio et le **poids du stock dans l’ETF**."
+                "Chaque ligne représente un **stock** présent dans les **top holdings** d’un ETF, "
+                "avec son poids (%) estimé."
             )
 
-            st.dataframe(df_result, use_container_width=True, height=500)
+            st.dataframe(df_links, use_container_width=True, height=500)
 
-            # Bouton de téléchargement
-            csv = df_result.to_csv(index=False).encode("utf-8")
+            csv = df_links.to_csv(index=False).encode("utf-8")
             st.download_button(
-                "💾 Télécharger en CSV",
+                "💾 Télécharger les résultats en CSV",
                 data=csv,
-                file_name="stock_etf_exposure_etfdb.csv",
+                file_name="stock_etf_top_holdings_yf.csv",
                 mime="text/csv"
             )
+
+            if not df_matrix.empty:
+                st.subheader("🧊 Matrice poids (%) stocks × ETF")
+                st.write("Les valeurs représentent le **poids (%)** du stock dans chaque ETF (top holdings).")
+                st.dataframe(df_matrix, use_container_width=True, height=400)
 else:
     st.info(
-        "👈 Entre une liste de stocks (et éventuellement un CSV) puis clique sur **🚀 Lancer le scan**.\n\n"
-        "Les données proviennent de ETFdb (pages publiques `https://etfdb.com/stock/<SYMBOL>/`)."
+        "👈 Entre une liste d’ETF et une liste de stocks, puis clique sur **🚀 Lancer le scan**.\n\n"
+        "Les données viennent de Yahoo Finance via la librairie `yfinance`."
     )
